@@ -1,180 +1,121 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+import { ClsService } from 'nestjs-cls';
 import { PrismaService } from '../prisma/prisma.service';
 import { EmailService } from '../email/email.service';
 import { CreateTaskDto } from './dto/create-task.dto';
 import { UpdateTaskDto } from './dto/update-task.dto';
 import { TaskFilterDto } from './dto/task-filter.dto';
-import { Task, Prisma } from '@prisma/client';
+import { TasksRepository, TaskWithRelations } from './tasks.repository';
+import { toTaskResponse, TaskResponse } from './dto/task-response.dto';
+import { paginated, Paginated } from '../common/dto/paginated';
+import { CLS_USER_ID_KEY } from '../common/constants';
+import { ActivitiesService } from '../activities/activities.service';
+import { TaskActivityFilterDto } from '../activities/dto/activity-filter.dto';
+import {
+  TASK_CREATED,
+  TASK_UPDATED,
+  TaskCreatedEvent,
+  TaskUpdatedEvent,
+} from './task.events';
 
 @Injectable()
 export class TasksService {
+  private readonly logger = new Logger(TasksService.name);
+
   constructor(
-    private prisma: PrismaService,
-    private emailService: EmailService,
+    private readonly prisma: PrismaService,
+    private readonly tasksRepository: TasksRepository,
+    private readonly emailService: EmailService,
+    private readonly activitiesService: ActivitiesService,
+    private readonly events: EventEmitter2,
+    private readonly cls: ClsService,
   ) {}
 
-  async findAll(filterDto: TaskFilterDto) {
-    const tasks = await this.prisma.task.findMany();
-
-    const tasksWithRelations = await Promise.all(
-      tasks.map(async (task) => {
-        const assignee = task.assigneeId
-          ? await this.prisma.user.findUnique({ where: { id: task.assigneeId } })
-          : null;
-
-        const project = await this.prisma.project.findUnique({
-          where: { id: task.projectId }
-        });
-
-        const tags = await this.prisma.tag.findMany({
-          where: {
-            tasks: {
-              some: { id: task.id }
-            }
-          }
-        });
-
-        return {
-          ...task,
-          assignee,
-          project,
-          tags,
-        };
-      })
-    );
-
-    let filteredTasks = tasksWithRelations;
-
-    if (filterDto.status) {
-      filteredTasks = filteredTasks.filter(task => task.status === filterDto.status);
+  private currentUserId(): string {
+    const userId = this.cls.get<string>(CLS_USER_ID_KEY);
+    if (!userId) {
+      throw new Error('currentUserId() called without a user in CLS — guard invariant broken');
     }
-
-    if (filterDto.priority) {
-      filteredTasks = filteredTasks.filter(task => task.priority === filterDto.priority);
-    }
-
-    if (filterDto.assigneeId) {
-      filteredTasks = filteredTasks.filter(task => task.assigneeId === filterDto.assigneeId);
-    }
-
-    if (filterDto.projectId) {
-      filteredTasks = filteredTasks.filter(task => task.projectId === filterDto.projectId);
-    }
-
-    if (filterDto.dueDateFrom || filterDto.dueDateTo) {
-      filteredTasks = filteredTasks.filter(task => {
-        if (!task.dueDate) return false;
-        const dueDate = new Date(task.dueDate);
-
-        if (filterDto.dueDateFrom && dueDate < new Date(filterDto.dueDateFrom)) {
-          return false;
-        }
-
-        if (filterDto.dueDateTo && dueDate > new Date(filterDto.dueDateTo)) {
-          return false;
-        }
-
-        return true;
-      });
-    }
-
-    return filteredTasks;
+    return userId;
   }
 
-  async findOne(id: string) {
-    const task = await this.prisma.task.findUnique({
-      where: { id },
-      include: {
-        assignee: true,
-        project: true,
-        tags: true,
-      },
-    });
+  async findAll(filter: TaskFilterDto): Promise<Paginated<TaskResponse>> {
+    const [rows, total] = await this.tasksRepository.findAllPaginated(filter);
+    return paginated(rows.map(toTaskResponse), total, filter.page, filter.perPage);
+  }
 
+  async findOne(id: string): Promise<TaskResponse> {
+    return toTaskResponse(await this.loadOrThrow(id));
+  }
+
+  private async loadOrThrow(id: string): Promise<TaskWithRelations> {
+    const task = await this.tasksRepository.findById(id);
     if (!task) {
       throw new NotFoundException(`Task with ID ${id} not found`);
     }
-
     return task;
   }
 
-  async create(createTaskDto: CreateTaskDto) {
-    const task = await this.prisma.task.create({
-      data: {
-        title: createTaskDto.title,
-        description: createTaskDto.description,
-        status: createTaskDto.status,
-        priority: createTaskDto.priority,
-        dueDate: createTaskDto.dueDate,
-        project: { connect: { id: createTaskDto.projectId } },
-        assignee: createTaskDto.assigneeId
-          ? { connect: { id: createTaskDto.assigneeId } }
-          : undefined,
-        tags: createTaskDto.tagIds
-          ? { connect: createTaskDto.tagIds.map(id => ({ id })) }
-          : undefined,
-      },
-      include: {
-        assignee: true,
-        project: true,
-        tags: true,
-      },
+  async findActivities(taskId: string, filter: TaskActivityFilterDto) {
+    await this.loadOrThrow(taskId);
+    return this.activitiesService.findByTask(taskId, filter);
+  }
+
+  async create(dto: CreateTaskDto): Promise<TaskResponse> {
+    const userId = this.currentUserId();
+
+    const task = await this.prisma.$transaction(async (tx) => {
+      const created = await this.tasksRepository.create(dto, tx);
+      const event: TaskCreatedEvent = { tx, userId, task: created };
+      await this.events.emitAsync(TASK_CREATED, event);
+      return created;
     });
 
     if (task.assignee) {
-      await this.emailService.sendTaskAssignmentNotification(
-        task.assignee.email,
-        task.title
-      );
+      this.notifyAssignee(task.assignee.email, task.title);
     }
 
-    return task;
+    return toTaskResponse(task);
   }
 
-  async update(id: string, updateTaskDto: UpdateTaskDto) {
-    const existingTask = await this.findOne(id);
+  async update(id: string, dto: UpdateTaskDto): Promise<TaskResponse> {
+    const userId = this.currentUserId();
+    const existingTask = await this.loadOrThrow(id);
 
-    const task = await this.prisma.task.update({
-      where: { id },
-      data: {
-        title: updateTaskDto.title,
-        description: updateTaskDto.description,
-        status: updateTaskDto.status,
-        priority: updateTaskDto.priority,
-        dueDate: updateTaskDto.dueDate,
-        assignee: updateTaskDto.assigneeId !== undefined
-          ? updateTaskDto.assigneeId
-            ? { connect: { id: updateTaskDto.assigneeId } }
-            : { disconnect: true }
-          : undefined,
-        tags: updateTaskDto.tagIds
-          ? { set: updateTaskDto.tagIds.map(id => ({ id })) }
-          : undefined,
-      },
-      include: {
-        assignee: true,
-        project: true,
-        tags: true,
-      },
+    const task = await this.prisma.$transaction(async (tx) => {
+      const updated = await this.tasksRepository.update(id, dto, tx);
+
+      await this.events.emitAsync(TASK_UPDATED, {
+        tx,
+        userId,
+        before: existingTask,
+        after: updated,
+        dto,
+      } as TaskUpdatedEvent);
+
+      return updated;
     });
 
-    if (updateTaskDto.assigneeId && updateTaskDto.assigneeId !== existingTask.assigneeId) {
-      await this.emailService.sendTaskAssignmentNotification(
-        task.assignee!.email,
-        task.title
-      );
+    if (dto.assigneeId && dto.assigneeId !== existingTask.assigneeId) {
+      this.notifyAssignee(task.assignee!.email, task.title);
     }
 
-    return task;
+    return toTaskResponse(task);
   }
 
   async remove(id: string) {
-    await this.findOne(id);
-
-    await this.prisma.task.delete({
-      where: { id },
-    });
-
+    await this.loadOrThrow(id);
+    await this.tasksRepository.delete(id);
     return { message: 'Task deleted successfully' };
+  }
+
+  private notifyAssignee(email: string, title: string): void {
+    this.emailService
+      .sendTaskAssignmentNotification(email, title)
+      .catch((err: unknown) => {
+        const reason = err instanceof Error ? err.message : String(err);
+        this.logger.error(`Failed to send task assignment notification to ${email}: ${reason}`);
+      });
   }
 }

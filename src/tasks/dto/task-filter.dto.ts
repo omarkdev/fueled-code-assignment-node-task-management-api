@@ -1,7 +1,8 @@
 import { IsOptional, IsEnum, IsUUID, IsDateString } from 'class-validator';
 import { TaskStatus, TaskPriority } from '@prisma/client';
+import { PaginationQueryDto } from '../../common/dto/pagination.dto';
 
-export class TaskFilterDto {
+export class TaskFilterDto extends PaginationQueryDto {
   @IsOptional()
   @IsEnum(TaskStatus)
   status?: TaskStatus;
